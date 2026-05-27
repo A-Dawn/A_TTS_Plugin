@@ -1,0 +1,36 @@
+{
+  "manifest_version": 2,
+  "version": "1.1.1",
+  "name": "A_TTS_plugin",
+  "description": "基于 GPT-SoVITS API 将 MaiBot 文本回复转换为标准语音消息。",
+  "author": {
+    "name": "Dawn ARC",
+    "url": "https://github.com/A-Dawn"
+  },
+  "license": "GPL-v3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/A-Dawn/A_TTS_plugin",
+    "homepage": "https://github.com/A-Dawn/A_TTS_plugin",
+    "documentation": "https://github.com/A-Dawn/A_TTS_plugin#readme",
+    "issues": "https://github.com/A-Dawn/A_TTS_plugin/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.0.0"
+  },
+  "sdk": {
+    "min_version": "2.5.2",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "a-dawn.a-tts-plugin"
+}

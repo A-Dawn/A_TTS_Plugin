@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple, cast
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, cast
 from urllib.parse import urljoin
 
 import asyncio
@@ -30,7 +30,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件。")
-    config_version: str = Field(default="1.1.1", description="配置版本。")
+    config_version: str = Field(default="1.1.3", description="配置版本。")
     debug: bool = Field(default=False, description="是否输出调试日志。")
 
 
@@ -114,6 +114,10 @@ class BehaviorConfig(PluginConfigBase):
     allow_private: bool = Field(default=True, description="是否允许私聊使用。")
     allowed_group_ids: List[str] = Field(default_factory=list, description="允许使用的群 ID，空列表表示不限制。")
     control_user_ids: List[str] = Field(default_factory=list, description="允许执行 /voice 命令的用户 ID，空列表表示不限制。")
+    admin_user_ids: List[str] = Field(
+        default_factory=list,
+        description="允许执行 /voice on/off <群号或 QQ 号> 的管理员用户 ID。留空时会复用 control_user_ids；两者都为空则无管理员。",
+    )
     fallback_to_text_on_error: bool = Field(default=True, description="TTS 失败时是否回退发送原文本。")
     max_text_length: int = Field(default=300, ge=1, le=5000, description="允许语音化的最大文本长度。")
 
@@ -321,6 +325,7 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
         super().__init__()
         self._state_lock = asyncio.Lock()
         self._session_states: Dict[str, VoiceSessionState] = defaultdict(VoiceSessionState)
+        self._target_voice_ids: Set[str] = set()
         self._client = GPTSoVITSClient(self._get_logger())
         self._applied_weights: Tuple[str, str] = ("", "")
         self._weights_ready = True
@@ -337,6 +342,7 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
 
         async with self._state_lock:
             self._session_states.clear()
+            self._target_voice_ids.clear()
         self.ctx.logger.info("GPT-SoVITS 语音回复插件已卸载。")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, object], version: str) -> None:
@@ -410,6 +416,49 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
 
         return str(user_id or "").strip()
 
+    @classmethod
+    def _normalize_user_ids(cls, user_ids: List[str]) -> Set[str]:
+        """规范化用户 ID 列表。"""
+
+        return {normalized for item in user_ids if (normalized := cls._normalize_user_id(str(item)))}
+
+    @staticmethod
+    def _normalize_target_id(target_id: str) -> str:
+        """规范化群号或 QQ 号。"""
+
+        return str(target_id or "").strip()
+
+    @classmethod
+    def _is_valid_target_id(cls, target_id: str) -> bool:
+        """判断命令参数是否是有效的群号或 QQ 号。"""
+
+        return cls._normalize_target_id(target_id).isdigit()
+
+    @classmethod
+    def _extract_private_target_id(cls, message: Dict[str, Any]) -> str:
+        """从私聊出站消息中提取目标 QQ 号。"""
+
+        message_info = message.get("message_info")
+        if not isinstance(message_info, dict):
+            return ""
+        additional_config = message_info.get("additional_config")
+        if not isinstance(additional_config, dict):
+            return ""
+        for key in ("platform_io_target_user_id", "target_user_id", "user_id"):
+            target_id = cls._normalize_target_id(str(additional_config.get(key) or ""))
+            if target_id:
+                return target_id
+        return ""
+
+    @classmethod
+    def _extract_chat_target_id(cls, message: Dict[str, Any]) -> str:
+        """提取当前出站聊天流对应的群号或 QQ 号。"""
+
+        group_id = cls._extract_group_id(message)
+        if group_id:
+            return group_id
+        return cls._extract_private_target_id(message)
+
     @staticmethod
     def _is_group_message(message: Dict[str, Any]) -> bool:
         """判断消息是否属于群聊。"""
@@ -448,12 +497,30 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
             return False, "当前配置不允许私聊使用语音回复"
         return True, ""
 
-    @staticmethod
-    def _check_control_permission(user_id: str, config: GPTSoVITSVoiceReplyConfig) -> bool:
+    @classmethod
+    def _check_control_permission(cls, user_id: str, config: GPTSoVITSVoiceReplyConfig) -> bool:
         """检查 /voice 命令权限。"""
 
-        allowed_user_ids = {str(item).strip() for item in config.behavior.control_user_ids if str(item).strip()}
-        return not allowed_user_ids or user_id in allowed_user_ids
+        normalized_user_id = cls._normalize_user_id(user_id)
+        allowed_user_ids = cls._normalize_user_ids(config.behavior.control_user_ids)
+        admin_user_ids = cls._normalize_user_ids(config.behavior.admin_user_ids)
+        return not allowed_user_ids or normalized_user_id in allowed_user_ids or normalized_user_id in admin_user_ids
+
+    @classmethod
+    def _get_admin_user_ids(cls, config: GPTSoVITSVoiceReplyConfig) -> Set[str]:
+        """获取允许控制目标聊天语音模式的管理员用户 ID。"""
+
+        admin_user_ids = cls._normalize_user_ids(config.behavior.admin_user_ids)
+        if admin_user_ids:
+            return admin_user_ids
+        return cls._normalize_user_ids(config.behavior.control_user_ids)
+
+    @classmethod
+    def _check_admin_permission(cls, user_id: str, config: GPTSoVITSVoiceReplyConfig) -> bool:
+        """检查目标聊天语音模式管理员权限。"""
+
+        normalized_user_id = cls._normalize_user_id(user_id)
+        return bool(normalized_user_id) and normalized_user_id in cls._get_admin_user_ids(config)
 
     @staticmethod
     def _contains_only_convertible_segments(raw_message: Any) -> bool:
@@ -503,19 +570,10 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
 
     @classmethod
     def _replace_text_with_voice(cls, message: Dict[str, Any], audio_bytes: bytes, text: str) -> Dict[str, Any]:
-        """将文本消息替换为语音消息，同时保留回复组件。"""
+        """将文本消息替换为独立语音消息。"""
 
         modified_message = copy.deepcopy(message)
-        raw_message = modified_message.get("raw_message")
-        preserved_segments: List[Dict[str, Any]] = []
-        if isinstance(raw_message, list):
-            for segment in raw_message:
-                if not isinstance(segment, dict):
-                    continue
-                if str(segment.get("type") or "").strip().lower() == "reply":
-                    preserved_segments.append(copy.deepcopy(segment))
-        preserved_segments.append(cls._build_voice_segment(audio_bytes, text))
-        modified_message["raw_message"] = preserved_segments
+        modified_message["raw_message"] = [cls._build_voice_segment(audio_bytes, text)]
         modified_message["processed_plain_text"] = "[语音消息]"
         modified_message["is_emoji"] = False
         modified_message["is_picture"] = False
@@ -533,6 +591,12 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
                 control_ack_suppress_count=state.control_ack_suppress_count,
             )
 
+    async def _get_target_ids_snapshot(self) -> Set[str]:
+        """读取已开启语音回复的目标 ID 快照。"""
+
+        async with self._state_lock:
+            return set(self._target_voice_ids)
+
     async def _set_session_enabled(self, session_id: str, enabled: bool) -> None:
         """设置会话级语音回复状态。"""
 
@@ -541,6 +605,18 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
             state.enabled = enabled
             if not enabled:
                 state.once_pending = False
+
+    async def _set_target_enabled(self, target_id: str, enabled: bool) -> None:
+        """设置指定群号或 QQ 号的语音回复状态。"""
+
+        async with self._state_lock:
+            normalized_target_id = self._normalize_target_id(target_id)
+            if not normalized_target_id:
+                return
+            if enabled:
+                self._target_voice_ids.add(normalized_target_id)
+            else:
+                self._target_voice_ids.discard(normalized_target_id)
 
     async def _set_once_pending(self, session_id: str) -> None:
         """设置下一条回复语音化。"""
@@ -564,7 +640,7 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
             state.control_ack_suppress_count -= 1
             return True
 
-    async def _should_voice_reply(self, session_id: str) -> bool:
+    async def _should_voice_reply(self, session_id: str, target_id: str) -> bool:
         """判断并消费一次性语音化状态。"""
 
         async with self._state_lock:
@@ -572,12 +648,15 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
             if state.once_pending:
                 state.once_pending = False
                 return True
-            return state.enabled
+            if state.enabled:
+                return True
+            normalized_target_id = self._normalize_target_id(target_id)
+            return bool(normalized_target_id) and normalized_target_id in self._target_voice_ids
 
     @Command(
         "voice_reply",
         description="控制 GPT-SoVITS 语音回复模式",
-        pattern=r"^/voice(?:\s+(?P<action>on|off|once|status))?\s*$",
+        pattern=r"^/voice(?:\s+(?P<action>on|off|once|status)(?:\s+(?P<target_id>\S+))?)?\s*$",
         intercept_message_level=1,
     )
     async def handle_voice_command(
@@ -602,7 +681,27 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
             return False, "没有权限", True
 
         action = str((matched_groups or {}).get("action") or "status").strip().lower()
+        target_id = self._normalize_target_id(str((matched_groups or {}).get("target_id") or ""))
+        if target_id and action not in {"on", "off"}:
+            await self._increase_control_suppress_count(stream_id)
+            await self.ctx.send.text("只有 /voice on/off 支持目标群号或 QQ 号参数。", stream_id)
+            return False, "不支持的目标语音命令", True
+        if target_id and not self._is_valid_target_id(target_id):
+            await self._increase_control_suppress_count(stream_id)
+            await self.ctx.send.text("目标 ID 应填写群号或 QQ 号，例如 /voice on 123456789。", stream_id)
+            return False, "目标 ID 无效", True
+        if target_id and not self._check_admin_permission(user_id, config):
+            await self._increase_control_suppress_count(stream_id)
+            await self.ctx.send.text("只有管理员可以控制指定群号或 QQ 号的语音模式。", stream_id)
+            return False, "没有管理员权限", True
+
         if action == "on":
+            if target_id:
+                await self._set_target_enabled(target_id, True)
+                await self._increase_control_suppress_count(stream_id)
+                await self.ctx.send.text(f"已开启目标 {target_id} 的语音回复。", stream_id)
+                return True, f"已开启目标 {target_id} 的语音回复", True
+
             if not config.behavior.session_mode_enabled:
                 await self._increase_control_suppress_count(stream_id)
                 await self.ctx.send.text("当前配置不允许开启会话级持续语音模式。", stream_id)
@@ -613,6 +712,12 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
             return True, "已开启本会话语音回复", True
 
         if action == "off":
+            if target_id:
+                await self._set_target_enabled(target_id, False)
+                await self._increase_control_suppress_count(stream_id)
+                await self.ctx.send.text(f"已关闭目标 {target_id} 的语音回复。", stream_id)
+                return True, f"已关闭目标 {target_id} 的语音回复", True
+
             await self._set_session_enabled(stream_id, False)
             await self._increase_control_suppress_count(stream_id)
             await self.ctx.send.text("已关闭本会话语音回复。", stream_id)
@@ -625,10 +730,16 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
             return True, "下一条回复将使用语音", True
 
         state = await self._get_state_snapshot(stream_id)
+        target_ids = await self._get_target_ids_snapshot()
         status_text = "开启" if state.enabled else "关闭"
         once_text = "有" if state.once_pending else "无"
+        target_text = "、".join(sorted(target_ids)) if target_ids else "无"
         await self._increase_control_suppress_count(stream_id)
-        await self.ctx.send.text(f"语音回复状态：持续模式={status_text}，下一条语音={once_text}。", stream_id)
+        await self.ctx.send.text(
+            f"语音回复状态：当前会话持续模式={status_text}，下一条语音={once_text}，"
+            f"目标 ID={target_text}。",
+            stream_id,
+        )
         return True, "已查询语音回复状态", True
 
     @Tool(
@@ -717,7 +828,8 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
         if await self._consume_control_suppress(session_id):
             return self._build_hook_result(modified_kwargs)
 
-        should_voice = await self._should_voice_reply(session_id)
+        target_id = self._extract_chat_target_id(message)
+        should_voice = await self._should_voice_reply(session_id, target_id)
         if not should_voice:
             return self._build_hook_result(modified_kwargs)
 
@@ -757,6 +869,8 @@ class GPTSoVITSVoiceReplyPlugin(MaiBotPlugin):
             return self._build_abort_result("GPT-SoVITS 语音合成失败", modified_kwargs)
 
         modified_kwargs["message"] = self._replace_text_with_voice(message, audio_bytes, text)
+        modified_kwargs["set_reply"] = False
+        modified_kwargs["reply_message_id"] = None
         if config.plugin.debug:
             self._get_logger().debug(f"已将文本回复转换为语音: session_id={session_id} bytes={len(audio_bytes)}")
         return self._build_hook_result(modified_kwargs)

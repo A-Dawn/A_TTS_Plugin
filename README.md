@@ -6,6 +6,7 @@
 
 - `/voice on`：本会话持续语音回复。
 - `/voice off`：关闭本会话语音回复。
+- `/voice on <群号或QQ号>` / `/voice off <群号或QQ号>`：开启或关闭指定聊天目标的语音回复，仅管理员可用。
 - `/voice once`：下一条回复使用语音。
 - `/voice status`：查看当前状态。
 - `use_voice_reply`：供 Maisaka 决策调用，只标记下一条回复需要语音化。
@@ -19,6 +20,7 @@
 - `weights.gpt_weights_path` / `weights.sovits_weights_path`：需要切换的权重路径。
 - `tts` 与 `inference`：默认使用 GPT-SoVITS API 推理参数；将 `inference.enabled` 改为 `true` 后才会发送本地推理配置。
 - `behavior.fallback_to_text_on_error`：语音合成失败时是否发送原文本。
+- `behavior.admin_user_ids`：允许控制指定群号或 QQ 号语音回复的管理员用户 ID。
 
 完整字段说明见 [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md)。
 

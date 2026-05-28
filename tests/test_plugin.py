@@ -102,17 +102,24 @@ def _build_plugin(config: Any | None = None) -> Any:
     return plugin
 
 
-def _build_message(raw_message: List[Dict[str, Any]], group_id: str = "") -> Dict[str, Any]:
+def _build_message(
+    raw_message: List[Dict[str, Any]],
+    group_id: str = "",
+    session_id: str = "stream-1",
+    private_target_id: str = "",
+) -> Dict[str, Any]:
     """构造 send_service.before_send 使用的消息字典。"""
 
     group_info = {"group_id": group_id, "group_name": "测试群"} if group_id else None
+    additional_config = {"platform_io_target_user_id": private_target_id} if private_target_id else {}
     return {
-        "session_id": "stream-1",
+        "session_id": session_id,
         "message_id": "message-1",
         "platform": "qq",
         "message_info": {
             "user_info": {"user_id": "user-1", "user_nickname": "测试用户"},
             "group_info": group_info,
+            "additional_config": additional_config,
         },
         "processed_plain_text": "你好，世界",
         "raw_message": raw_message,
@@ -259,7 +266,7 @@ async def test_synthesize_success_and_error_handling(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
-async def test_before_send_converts_text_to_voice_and_preserves_context() -> None:
+async def test_before_send_converts_text_to_voice_without_reply_context() -> None:
     plugin = _build_plugin()
     plugin._client = _FakeTTSClient(audio_bytes=b"audio-bytes")
     await plugin._set_once_pending("stream-1")
@@ -278,12 +285,11 @@ async def test_before_send_converts_text_to_voice_and_preserves_context() -> Non
     assert result["action"] == "continue"
     assert modified_message["session_id"] == "stream-1"
     assert modified_message["message_id"] == "message-1"
-    assert result["modified_kwargs"]["set_reply"] is True
-    assert result["modified_kwargs"]["reply_message_id"] == "origin-1"
+    assert result["modified_kwargs"]["set_reply"] is False
+    assert result["modified_kwargs"]["reply_message_id"] is None
     assert modified_message["processed_plain_text"] == "[语音消息]"
-    assert modified_message["raw_message"][0]["type"] == "reply"
-    assert modified_message["raw_message"][1]["type"] == "voice"
-    assert base64.b64decode(modified_message["raw_message"][1]["binary_data_base64"]) == b"audio-bytes"
+    assert [segment["type"] for segment in modified_message["raw_message"]] == ["voice"]
+    assert base64.b64decode(modified_message["raw_message"][0]["binary_data_base64"]) == b"audio-bytes"
     assert plugin._client.calls[0][0] == "你好\n世界"
 
 
@@ -345,6 +351,92 @@ async def test_voice_command_sets_state_and_suppresses_control_ack() -> None:
     assert hook_result["modified_kwargs"]["message"]["processed_plain_text"] == "你好，世界"
     assert state_after_hook.enabled is True
     assert state_after_hook.control_ack_suppress_count == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_can_toggle_voice_target_ids() -> None:
+    config = _build_config()
+    config.behavior.admin_user_ids = ["admin-1"]
+    plugin = _build_plugin(config)
+    plugin._client = _FakeTTSClient(audio_bytes=b"target-audio")
+
+    handled, message, intercepted = await plugin.handle_voice_command(
+        stream_id="admin-stream",
+        user_id="admin-1",
+        matched_groups={"action": "on", "target_id": "123456"},
+    )
+    target_ids = await plugin._get_target_ids_snapshot()
+    group_result = await plugin.handle_before_send(
+        message=_build_message([{"type": "text", "data": "群聊消息"}], group_id="123456", session_id="group-stream")
+    )
+    private_result = await plugin.handle_before_send(
+        message=_build_message(
+            [{"type": "text", "data": "私聊消息"}],
+            session_id="private-stream",
+            private_target_id="654321",
+        )
+    )
+
+    assert handled is True
+    assert message == "已开启目标 123456 的语音回复"
+    assert intercepted is True
+    assert target_ids == {"123456"}
+    assert group_result["modified_kwargs"]["message"]["raw_message"][0]["type"] == "voice"
+    assert private_result["modified_kwargs"]["message"]["processed_plain_text"] == "你好，世界"
+
+    handled, message, intercepted = await plugin.handle_voice_command(
+        stream_id="admin-stream",
+        user_id="admin-1",
+        matched_groups={"action": "on", "target_id": "654321"},
+    )
+    private_result = await plugin.handle_before_send(
+        message=_build_message(
+            [{"type": "text", "data": "私聊消息"}],
+            session_id="private-stream-2",
+            private_target_id="654321",
+        )
+    )
+
+    assert handled is True
+    assert message == "已开启目标 654321 的语音回复"
+    assert intercepted is True
+    assert private_result["modified_kwargs"]["message"]["raw_message"][0]["type"] == "voice"
+
+    handled, message, intercepted = await plugin.handle_voice_command(
+        stream_id="admin-stream",
+        user_id="admin-1",
+        matched_groups={"action": "off", "target_id": "123456"},
+    )
+    target_ids = await plugin._get_target_ids_snapshot()
+    group_result = await plugin.handle_before_send(
+        message=_build_message([{"type": "text", "data": "群聊消息"}], group_id="123456", session_id="group-stream-2")
+    )
+
+    assert handled is True
+    assert message == "已关闭目标 123456 的语音回复"
+    assert intercepted is True
+    assert target_ids == {"654321"}
+    assert group_result["modified_kwargs"]["message"]["processed_plain_text"] == "你好，世界"
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_toggle_target_voice_mode() -> None:
+    config = _build_config()
+    config.behavior.admin_user_ids = ["admin-1"]
+    plugin = _build_plugin(config)
+
+    handled, message, intercepted = await plugin.handle_voice_command(
+        stream_id="stream-1",
+        user_id="user-1",
+        matched_groups={"action": "on", "target_id": "654321"},
+    )
+    target_ids = await plugin._get_target_ids_snapshot()
+
+    assert handled is False
+    assert message == "没有管理员权限"
+    assert intercepted is True
+    assert plugin.ctx.send.text_calls == [("只有管理员可以控制指定群号或 QQ 号的语音模式。", "stream-1")]
+    assert target_ids == set()
 
 
 @pytest.mark.asyncio
